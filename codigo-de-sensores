@@ -1,0 +1,321 @@
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_MLX90640.h>
+#include <DFRobot_HumanDetection.h>
+
+// RED WIFI PROPIA DEL ESP32
+const char* nombreRed = "ESP32-SignosVitales";
+const char* claveRed = "ESP32Vitales26";
+
+IPAddress ip(192, 168, 4, 1);
+IPAddress puerta(192, 168, 4, 1);
+IPAddress mascara(255, 255, 255, 0);
+
+WebServer servidor(80);
+
+// PINES DEL C1001
+#define RX_RADAR 16
+#define TX_RADAR 17
+
+// PINES DEL MLX90640
+#define SDA_TERM 21
+#define SCL_TERM 22
+
+DFRobot_HumanDetection radar(&Serial2);
+Adafruit_MLX90640 mlx;
+
+bool radarOK = false;
+bool termicaOK = false;
+bool frameOK = false;
+
+float temperaturas[768];
+
+int presencia = 0;
+int movimiento = 0;
+int estadoResp = 0;
+int corazon = 0;
+int respiracion = 0;
+int distancia = 0;
+
+unsigned long ultimaRadar = 0;
+unsigned long ultimaTermica = 0;
+
+const unsigned long INTERVALO_RADAR = 1500;
+const unsigned long INTERVALO_TERMICA = 2500;
+
+// PAGINA WEB
+const char pagina[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport"
+content="width=device-width, initial-scale=1">
+<title>Monitor ESP32</title>
+<style>
+body {
+  background:#101827;
+  color:white;
+  font-family:Arial,sans-serif;
+  margin:0;
+  padding:20px;
+}
+h1 {text-align:center;}
+p {color:#b9c4d4;}
+.grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:12px;
+}
+.card {
+  background:#223047;
+  padding:18px;
+  border-radius:12px;
+  text-align:center;
+}
+.valor {
+  font-size:28px;
+  font-weight:bold;
+  margin-top:12px;
+}
+canvas {
+  width:100%;
+  max-width:640px;
+  image-rendering:pixelated;
+  border-radius:8px;
+}
+.estado {text-align:center;}
+</style>
+</head>
+<body>
+
+<h1>Monitor de Signos Vitales</h1>
+<p class="estado">ESP32 - Red WiFi propia</p>
+
+<h2>Radar C1001</h2>
+<div class="grid">
+<div class="card">Presencia<div class="valor" id="p">--</div></div>
+<div class="card">Movimiento<div class="valor" id="m">--</div></div>
+<div class="card">Distancia reportada<div class="valor" id="d">--</div></div>
+<div class="card">Estado respiratorio<div class="valor" id="e">--</div></div>
+<div class="card">Frecuencia cardiaca<div class="valor" id="c">--</div></div>
+<div class="card">Respiracion<div class="valor" id="r">--</div></div>
+</div>
+
+<h2>Camara termica MLX90640</h2>
+<div class="grid">
+<div class="card">Minima<div class="valor" id="min">--</div></div>
+<div class="card">Maxima<div class="valor" id="max">--</div></div>
+<div class="card">Promedio<div class="valor" id="prom">--</div></div>
+</div>
+
+<p id="estado">Esperando datos...</p>
+<canvas id="mapa" width="320" height="240"></canvas>
+
+<script>
+const canvas = document.getElementById("mapa");
+const ctx = canvas.getContext("2d");
+
+function pintar(datos) {
+  if (!datos || datos.length !== 768) return;
+
+  let validos = datos.filter(x => x > -40 && x < 300);
+  if (!validos.length) return;
+
+  let min = Math.min(...validos);
+  let max = Math.max(...validos);
+  let prom = validos.reduce((a,b)=>a+b,0)/validos.length;
+
+  document.getElementById("min").textContent = min.toFixed(1)+" C";
+  document.getElementById("max").textContent = max.toFixed(1)+" C";
+  document.getElementById("prom").textContent = prom.toFixed(1)+" C";
+
+  for(let i=0;i<768;i++){
+    let t = (datos[i]-min)/Math.max(max-min,0.1);
+    t = Math.max(0,Math.min(1,t));
+
+    // Escala: azul, rojo, amarillo
+    let hue = 240*(1-t);
+    ctx.fillStyle = `hsl(${hue},100%,50%)`;
+    ctx.fillRect((i%32)*10,Math.floor(i/32)*10,10,10);
+  }
+}
+
+async function actualizar(){
+  try{
+    let respuesta = await fetch("/datos",{cache:"no-store"});
+    if(!respuesta.ok) throw new Error("HTTP");
+
+    let d = await respuesta.json();
+
+    document.getElementById("p").textContent =
+      d.radarOK ? (d.presencia===1 ? "Detectada":"No detectada") : "Sin conexion";
+
+    document.getElementById("m").textContent =
+      d.radarOK ? d.movimiento : "--";
+
+    document.getElementById("d").textContent =
+      d.radarOK ? d.distancia : "--";
+
+    document.getElementById("e").textContent =
+      d.radarOK ? d.estado : "--";
+
+    document.getElementById("c").textContent =
+      d.corazon>0 && d.corazon<255 ? d.corazon+" BPM" : "Sin lectura";
+
+    document.getElementById("r").textContent =
+      d.respiracion>0 && d.respiracion<255 ?
+      d.respiracion+" rpm" : "Sin lectura";
+
+    if(d.temperaturas) pintar(d.temperaturas);
+
+    document.getElementById("estado").textContent =
+      "Radar: "+(d.radarOK?"conectado":"no disponible")+
+      " | Termica: "+(d.termicaOK?"conectada":"no disponible")+
+      " | Ultima consulta: "+new Date().toLocaleTimeString();
+  }catch(err){
+    document.getElementById("estado").textContent =
+      "Sin respuesta del ESP32";
+  }
+}
+
+actualizar();
+setInterval(actualizar,3000);
+</script>
+</body>
+</html>
+)HTML";
+
+// ENTREGAR DATOS EN JSON
+void enviarJSON() {
+  String json;
+  json.reserve(8500);
+
+  json = "{";
+  json += "\"radarOK\":";
+  json += (radarOK ? "true" : "false");
+  json += ",\"termicaOK\":";
+  json += (termicaOK ? "true" : "false");
+  json += ",\"presencia\":" + String(presencia);
+  json += ",\"movimiento\":" + String(movimiento);
+  json += ",\"distancia\":" + String(distancia);
+  json += ",\"estado\":" + String(estadoResp);
+  json += ",\"corazon\":" + String(corazon);
+  json += ",\"respiracion\":" + String(respiracion);
+
+  if (frameOK) {
+    json += ",\"temperaturas\":[";
+    for (int i=0;i<768;i++) {
+      if(i>0) json += ",";
+      json += String(temperaturas[i],1);
+    }
+    json += "]";
+  }
+
+  json += "}";
+  servidor.send(200,"application/json",json);
+}
+
+// LECTURA DEL RADAR
+void leerRadar() {
+  if (!radarOK) return;
+
+  presencia = radar.smHumanData(radar.eHumanPresence);
+  movimiento = radar.smHumanData(radar.eHumanMovement);
+  distancia = radar.smHumanData(radar.eHumanDistance);
+
+  estadoResp = radar.getBreatheState();
+  corazon = radar.getHeartRate();
+  respiracion = radar.getBreatheValue();
+}
+
+// LECTURA TERMICA
+void leerTermica() {
+  if (!termicaOK) return;
+
+  if(mlx.getFrame(temperaturas)==0) {
+    frameOK=true;
+  } else {
+    Serial.println("Error de lectura termica");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // INICIAR WIFI PROPIO
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(ip,puerta,mascara);
+
+  if (WiFi.softAP(nombreRed,claveRed)) {
+    Serial.println("Red ESP32 creada");
+    Serial.print("IP: ");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("Error al crear WiFi");
+  }
+
+  servidor.on("/",[](){
+    servidor.send_P(200,"text/html",pagina);
+  });
+  servidor.on("/datos",enviarJSON);
+  servidor.begin();
+
+  // INICIAR MLX90640
+  Wire.begin(SDA_TERM,SCL_TERM);
+  Wire.setClock(400000);
+
+  if(mlx.begin(0x33,&Wire)){
+    mlx.setMode(MLX90640_CHESS);
+    mlx.setResolution(MLX90640_ADC_18BIT);
+    mlx.setRefreshRate(MLX90640_2_HZ);
+    termicaOK=true;
+    Serial.println("MLX90640 conectado");
+  } else {
+    Serial.println("MLX90640 no responde");
+  }
+
+  // INICIAR C1001
+  Serial2.begin(
+    115200,SERIAL_8N1,RX_RADAR,TX_RADAR
+  );
+  delay(500);
+
+  if(radar.begin()==0){
+    Serial.println("Radar conectado");
+
+    if(radar.configWorkMode(radar.eSleepMode)==0){
+      if(radar.sensorRet()==0){
+        delay(1000);
+        radarOK=(radar.getWorkMode()==2);
+      }
+    }
+  }
+
+  Serial.println(radarOK ?
+    "C1001 listo modo 2" :
+    "C1001 sin inicializar");
+
+  Serial.println("Abrir http://192.168.4.1");
+}
+
+void loop() {
+  servidor.handleClient();
+
+  unsigned long ahora=millis();
+
+  if(ahora-ultimaRadar>=INTERVALO_RADAR){
+    ultimaRadar=ahora;
+    leerRadar();
+  }
+
+  servidor.handleClient();
+
+  if(ahora-ultimaTermica>=INTERVALO_TERMICA){
+    ultimaTermica=ahora;
+    leerTermica();
+  }
+}
